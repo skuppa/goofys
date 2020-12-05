@@ -745,7 +745,7 @@ func mpuCopyPart(fs *Goofys, from string, to string, mpuId string, bytes string,
 	params := &s3.UploadPartCopyInput{
 		Bucket:            &fs.bucket,
 		Key:               fs.key(to),
-		CopySource:        aws.String(pathEscape(from)),
+		CopySource:        aws.String(url.QueryEscape(from)),
 		UploadId:          &mpuId,
 		CopySourceRange:   &bytes,
 		CopySourceIfMatch: srcEtag,
@@ -892,7 +892,7 @@ func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, sr
 
 	params := &s3.CopyObjectInput{
 		Bucket:            &fs.bucket,
-		CopySource:        aws.String(pathEscape(from)),
+		CopySource:        aws.String(url.QueryEscape(from)),
 		Key:               fs.key(to),
 		StorageClass:      &storageClass,
 		ContentType:       fs.getMimeType(to),

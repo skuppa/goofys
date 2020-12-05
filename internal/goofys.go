@@ -577,13 +577,6 @@ func (fs *Goofys) key(name string) *string {
 	return &name
 }
 
-// note that this is NOT the same as url.PathEscape in golang 1.8,
-// as this preserves / and url.PathEscape converts / to %2F
-func pathEscape(path string) string {
-	u := url.URL{Path: path}
-	return u.EscapedPath()
-}
-
 func (fs *Goofys) allocateInodeId() (id fuseops.InodeID) {
 	id = fs.nextInodeID
 	fs.nextInodeID++
