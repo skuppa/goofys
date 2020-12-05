@@ -332,9 +332,6 @@ func (parent *Inode) Create(
 	fullName := parent.getChildName(name)
 	fs := parent.fs
 
-	parent.mu.Lock()
-	defer parent.mu.Unlock()
-
 	now := time.Now()
 	inode = NewInode(fs, parent, &name, &fullName)
 	inode.Attributes = InodeAttributes{
@@ -378,9 +375,6 @@ func (parent *Inode) MkDir(
 		err = mapAwsError(err)
 		return
 	}
-
-	parent.mu.Lock()
-	defer parent.mu.Unlock()
 
 	inode = NewInode(fs, parent, &name, &fullName)
 	inode.ToDir()

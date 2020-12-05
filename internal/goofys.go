@@ -973,9 +973,9 @@ func (fs *Goofys) CreateFile(
 	parent := fs.getInodeOrDie(op.Parent)
 	fs.mu.Unlock()
 
-	inode, fh := parent.Create(op.Name)
-
 	parent.mu.Lock()
+
+	inode, fh := parent.Create(op.Name)
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -1009,13 +1009,13 @@ func (fs *Goofys) MkDir(
 	parent := fs.getInodeOrDie(op.Parent)
 	fs.mu.Unlock()
 
+	parent.mu.Lock()
+
 	// ignore op.Mode for now
 	inode, err := parent.MkDir(op.Name)
 	if err != nil {
 		return err
 	}
-
-	parent.mu.Lock()
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
