@@ -297,8 +297,20 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	if fh.lastWriteError != nil {
 		return fh.lastWriteError
 	}
+	fileSize := int64(fh.inode.Attributes.Size)
+	fh.inode.logFuse("WriteFile fileSize", fileSize, fh.nextWriteOffset)
 
-	if offset != fh.nextWriteOffset {
+	if fileSize != 0 && fh.nextWriteOffset == 0 && offset == fileSize {
+		fh.inode.logFuse("WriteFile append file ", offset)
+		fs := fh.inode.fs
+		fh.poolHandle = fs.bufferPool
+		err = fh.initAppend(fs, fileSize)
+		if err != nil {
+			return
+		}
+		fh.dirty = true
+		fh.nextWriteOffset = fileSize
+	} else if offset != fh.nextWriteOffset {
 		fh.inode.errFuse("WriteFile: only sequential writes supported", fh.nextWriteOffset, offset)
 		fh.lastWriteError = syscall.ENOTSUP
 		return fh.lastWriteError
@@ -839,6 +851,133 @@ func (fh *FileHandle) FlushFile() (err error) {
 		// the file was renamed
 		err = renameObject(fs, fh.nextWriteOffset, *fh.mpuKey, *fh.inode.FullName())
 	}
+
+	return
+}
+
+func (fh *FileHandle) initAppend(fs *Goofys, size int64) (err error) {
+	fh.writeInit.Do(func() {
+		fh.mu.Unlock()
+		fh.mpuWG.Add(1)
+		fh.initMPU()
+		fh.mu.Lock()
+		readModifyWrite := fh.mpuAppendParts()
+		if readModifyWrite != "" {
+			// S3 files is less then 5MB, download existing file and then append
+			fh.inode.logFuse("initAppend existing file size is less than min part", size)
+
+			params := &s3.GetObjectInput{
+				Bucket: &fs.bucket,
+				Key:    fs.key(*fh.inode.FullName()),
+			}
+
+			params.Range = &readModifyWrite
+
+			resp, err := fs.s3.GetObject(params)
+			if err != nil {
+				s3Log.Error(err, params)
+				fh.lastWriteError = mapAwsError(err)
+				return
+			}
+
+			contentLength := int(*resp.ContentLength)
+			contentData := make([]byte, 0, contentLength)
+			contentData = contentData[0:contentLength]
+
+
+			nread, err := io.ReadFull(resp.Body, contentData)
+			if err != nil || nread != contentLength {
+				s3Log.Errorf("only read %v from %v, expecting %v: %v",
+					nread, readModifyWrite, contentLength, err)
+				fh.lastWriteError = fuse.EINVAL
+				return
+			}
+
+			if fh.buf == nil {
+				fh.buf = MBuf{}.Init(fh.poolHandle, uint64(size), true)
+			}
+			fh.buf.Write(contentData)
+			contentData = nil
+		}
+	})
+
+	return fh.lastWriteError
+}
+
+/*
+ * similar to mpuCopyParts, but we want to make sure that the last part we
+ * copied is > 5MB, because we will still append more data after
+ *
+ * if that's unavoidable (because the object is less than 5MB), return the range we need
+ * to read from to do read modify write
+ */
+func (fh *FileHandle) mpuAppendParts() (readModifyWriteRange string) {
+	// max part size is 5GB
+	const PART_SIZE = 5 * 1024 * 1024 * 1024
+	const MIN_PART_SIZE = 5 * 1024 * 1024
+
+	size := int64(fh.inode.Attributes.Size)
+	s3Log.Infof("mpuAppendParts start size '%v' Name '%v' ", size, fh.inode.FullName())
+	if size < MIN_PART_SIZE {
+		readModifyWriteRange = fmt.Sprintf("bytes=%v-%v", 0, size-1)
+		return
+	}
+
+	fs := fh.inode.fs
+
+	obj := *fh.inode.FullName()
+	//Veeva change start - make sure source eTag is populated properly
+	fh.inode.fillXattr()
+	//Veeva change end
+	srcEtag := string(fh.inode.s3Metadata["etag"])
+	fh.inode.logFuse("mpuAppendParts Part copy, source tag", srcEtag)
+
+	r := size % PART_SIZE
+	from := fs.bucket + "/" + obj
+
+	// Veeva comment - copy from s3 5G per part if last part is greater than 5MB (S3 multi upload min limit)
+	if r == 0 || r >= MIN_PART_SIZE {
+		fh.lastPartId = sizeToParts(size)
+		s3Log.Infof("mpuAppendParts - last part is greater than 5MB remaining '%v' lastPartId '%v'", r, fh.lastPartId)
+		mpuCopyParts(fs, size, from, obj, *fh.mpuId, &fh.mpuWG, &srcEtag,
+			fh.etags, &fh.lastWriteError)
+		return
+	}
+
+	// size % PART_SIZE = r -> size = a * PART_SIZE + r,
+	// so we want to find
+	// size = b * c + r2 such that r2 >= MIN_PART_SIZE
+	// let r2 = r + MIN_PART_SIZE
+	// size = b * c + r + MIN_PART_SIZE
+	// we want minimum parts, so let b = a + 1
+	// size = (a + 1) * c + r + MIN_PART_SIZE
+	// c = (size - r - MIN_PART_SIZE) / (a + 1)
+	// recall that a = size / PART_SIZE with integer division
+
+	new_part_size := (size - r - MIN_PART_SIZE) / (size/PART_SIZE + 1)
+	r2 := size % new_part_size
+	if r2 != 0 && r2 < MIN_PART_SIZE {
+		panic(fmt.Sprintf("size = %v r2 = %v new_part_size = %v", size, r2, new_part_size))
+	}
+
+	// Veeva comment - copy from s3 using new_part_size
+	s3Log.Infof("mpuAppendParts - recalculated part size '%v' ", new_part_size)
+	rangeTo := int64(0)
+	i := int64(1)
+
+	for ; rangeTo < size; i++ {
+		rangeFrom := rangeTo
+		rangeTo = i * new_part_size
+		if rangeTo > size {
+			rangeTo = size
+		}
+		bytes := fmt.Sprintf("bytes=%v-%v", rangeFrom, rangeTo-1)
+
+		fh.mpuWG.Add(1)
+		mpuCopyPart(fs, from, obj, *fh.mpuId, bytes, i, &fh.mpuWG, nil,
+			&fh.etags[i-1], &fh.lastWriteError)
+	}
+	fh.lastPartId = int(i) + 1
 
 	return
 }
